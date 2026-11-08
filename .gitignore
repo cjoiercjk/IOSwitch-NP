@@ -1,0 +1,8 @@
+/defaultGroup/bin/
+/defaultGroup/lib/
+/control/build/
+/build/icomp
+/build/ilink
+/build/license.dat
+/build/table_mapping.lp
+*.log

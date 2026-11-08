@@ -1,0 +1,8 @@
+#ifndef IOS_CONSTANTS_H
+#define IOS_CONSTANTS_H
+#define IOS_FLOWS 256
+#define IOS_WINDOW 64
+#define IOS_HANDOFF_PORT 18515
+#define IOS_MAGIC 0x494f5331
+#define DEBUG_CNTID_NUM 16
+#endif

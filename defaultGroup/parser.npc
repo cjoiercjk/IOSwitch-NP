@@ -1,0 +1,23 @@
+#include "headers.h"
+@parser void ParseEth() {
+ _extract(eth);
+ return switch(eth.Type) { case 0x0800: ParseIP; default: accept; }
+}
+@parser void ParseIP() {
+ _extract(ip);
+ return switch(ip.VI) { case 0x45: ParseIPProto; default: accept; }
+}
+@parser void ParseIPProto() {
+ return switch(ip.Proto) { case 17: ParseUDP; default: accept; }
+}
+@parser void ParseUDP() {
+ _extract(udp);
+ return switch(udp.Dst) { case 4791: ParseBTH; case 18515: ParseHandoff; default: accept; }
+}
+@parser void ParseBTH() {
+ _extract(bth);
+ return switch(bth.Op) { case 4: ParseCmd; case 17: ParseAck; default: accept; }
+}
+@parser void ParseCmd() { _extract(cmd); _extract(icrc); return accept; }
+@parser void ParseAck() { _extract(aeth); _extract(icrc); return accept; }
+@parser void ParseHandoff() { _extract(handoff); return accept; }

@@ -1,0 +1,177 @@
+#include "state.h"
+#include "wire.h"
+#include "crc_patch.h"
+@control void Drop() { npc_counter_add(debugCounter[1],1); npc_pkt_drop(); npc_exit(); }
+@control void UnlockDrop() { npc_lock_free(flowLocks[flowKey]); Drop(); }
+void SetRoute() {
+ npc_intrinsic_tm_metadata.OutSubChan = route.Channel[8:0];
+ npc_intrinsic_tm_metadata.Sqid = route.Sq;
+ npc_intrinsic_tm_metadata.Qindex = 1;
+ eth.Dst = route.Mac;
+}
+@control void Send() {
+ npc_pkt_add_sys_hdr(); npc_pkt_deparser(); npc_pkt_send(); npc_exit();
+}
+void MarkOwner() {
+ delta = seq - st.Owner;
+ if ((delta != 0) && (delta < 0x800000)) {
+  // Caller bounds new packets to the negotiated 64-packet window.
+  delta = delta - 1;
+  mask = 1;
+  if (delta < 32) { mask = mask << delta; st.SeenLo = st.SeenLo | mask; }
+  else { delta=delta-32; mask=mask << delta; st.SeenHi=st.SeenHi | mask; }
+  scanLo=st.SeenLo; scanHi=st.SeenHi; advance=0;
+  if (scanLo == 0xffffffff) { scanLo=scanHi; scanHi=0; advance=32; }
+  if (scanLo == 0xffffffff) { scanLo=0; scanHi=0; advance=advance+32; }
+  else {
+   if (scanLo[15:0] == 0xffff) { scanLo={scanHi[15:0],scanLo[31:16]}; scanHi=scanHi >> 16; advance=advance+16; }
+   if (scanLo[7:0] == 0xff) { scanLo={scanHi[7:0],scanLo[31:8]}; scanHi=scanHi >> 8; advance=advance+8; }
+   if (scanLo[3:0] == 0xf) { scanLo={scanHi[3:0],scanLo[31:4]}; scanHi=scanHi >> 4; advance=advance+4; }
+   if (scanLo[1:0] == 0x3) { scanLo={scanHi[1:0],scanLo[31:2]}; scanHi=scanHi >> 2; advance=advance+2; }
+   if (scanLo[0:0] == 0x1) { scanLo={scanHi[0:0],scanLo[31:1]}; scanHi=scanHi >> 1; advance=advance+1; }
+  }
+  st.SeenLo=scanLo; st.SeenHi=scanHi;
+  st.Owner = st.Owner + advance;
+ }
+}
+void SetSafe() {
+ delta = st.Access - st.Owner;
+ safePsn = st.Access;
+ if (delta < 0x800000) { safePsn = st.Owner; }
+}
+void FixIP() { uint<16> sum; ip.Sum=0; npc_checksum16_calc(sum,ip); ip.Sum=sum; }
+void FixAck() {
+ wireBth.Psn = safePsn;
+ PatchAckCrc();
+ // IPv4 UDP permits checksum zero; ICRC masks this field.
+ wireUdp.Sum=0;
+}
+void SnapshotRequest() {
+wireEth.Dst=eth.Dst; wireEth.Src=eth.Src; wireEth.Type=eth.Type;
+wireIp.VI=ip.VI; wireIp.Tos=ip.Tos; wireIp.Len=ip.Len; wireIp.Id=ip.Id; wireIp.Frag=ip.Frag; wireIp.Ttl=ip.Ttl; wireIp.Proto=ip.Proto; wireIp.Sum=ip.Sum; wireIp.Src=ip.Src; wireIp.Dst=ip.Dst;
+wireUdp.Src=udp.Src; wireUdp.Dst=udp.Dst; wireUdp.Len=udp.Len; wireUdp.Sum=udp.Sum;
+wireBth.Op=bth.Op; wireBth.Flags=bth.Flags; wireBth.Pkey=bth.Pkey; wireBth.R0=bth.R0; wireBth.Qp=bth.Qp; wireBth.R1=bth.R1; wireBth.Psn=bth.Psn;
+wireCmd.D0=cmd.D0; wireCmd.Nsid=cmd.Nsid; wireCmd.D2_5=cmd.D2_5; wireCmd.D6_9=cmd.D6_9; wireCmd.LbaLo=cmd.LbaLo; wireCmd.LbaHi=cmd.LbaHi; wireCmd.D12=cmd.D12; wireCmd.D13_15=cmd.D13_15;
+wireCrc.Value=icrc.Value;
+}
+@control void Main() {
+ npc_counter_add(debugCounter[0],1);
+ if (npc_intrinsic_metadata.PortType != 0) { Drop(); }
+ if (npc_pkt_get_valid(ip) == 0) { Drop(); }
+ if ((ip.VI != 0x45) || (ip.Frag[13:0] != 0)) { Drop(); }
+ if (ip.Len > npc_intrinsic_metadata.PacSize) { Drop(); }
+ // Ordinary IPv4 is forwarded through a configured route, without ACK processing.
+ routeKey=ip.Dst[7:0]; route=routeTable._lookup();
+ if ((route.Valid == 0) || (route.Ip != ip.Dst)) { Drop(); }
+ kind=0;
+ if (npc_pkt_get_valid(handoff) != 0) {
+  if ((handoff.Magic != IOS_MAGIC) || (handoff.Version != 1) || (handoff.Kind != 2)) { Drop(); }
+  if ((handoff.Flow > 255) || (udp.Len != 32) || (ip.Len != 52)) { Drop(); }
+  flowKey=handoff.Flow[7:0]; seq=handoff.Psn; kind=3;
+ } else {
+  if (npc_pkt_get_valid(bth) == 0) { SetRoute(); Send(); }
+  classKey=ip.Src[7:0] ^ ip.Dst[7:0]; classKey=classKey ^ bth.Qp[7:0];
+  cls=connectionTable._lookup();
+  if ((cls.Valid == 0) || (cls.Src != ip.Src) || (cls.Dst != ip.Dst) || (cls.Qp != bth.Qp)) { SetRoute(); Send(); }
+  flowKey=cls.Flow; seq=bth.Psn;
+  if (cls.Role == 1) {
+   if (bth.Op != 4) { Drop(); }
+   if ((ip.Len != 108) || (udp.Len != 88) || (bth.Flags[5:4] != 0)) { Drop(); }
+   if ((cmd.D0[31:24] != 1) && (cmd.D0[31:24] != 2)) { Drop(); }
+   // v1 supports one LBA per command, no inline data or multi-packet SEND.
+   if (cmd.D12[31:16] != 0) { Drop(); }
+   kind=1;
+  } else {
+   if (bth.Op != 17) { SetRoute(); Send(); }
+   if ((ip.Len != 48) || (udp.Len != 28) || (bth.Flags[5:4] != 0)) { Drop(); }
+   // AETH ACK=000xxxxx; all NAK/RNR/reserved syndromes are forwarded unchanged.
+   if (aeth.Syndrome[7:5] != 0) { npc_counter_add(debugCounter[5],1); SetRoute(); Send(); }
+   kind=2;
+  }
+ }
+ cfg=configTable._lookup();
+ if (cfg.Enabled == 0) { Drop(); }
+ if (kind == 3) {
+  if ((handoff.Epoch != cfg.Epoch) || (handoff.AccessIp != cfg.AccessIp) || (handoff.AccessQp != cfg.AccessQp) || (ip.Dst != cfg.ClientIp)) { Drop(); }
+ }
+ lockStatus=npc_lock_get(flowLocks[flowKey]);
+ if (lockStatus != 0) { npc_counter_add(debugCounter[6],1); Drop(); }
+ st=stateTable._lookup();
+ pendingKey={flowKey,seq[5:0]};
+ if (kind == 1) {
+  delta=seq-st.Owner;
+  if ((delta >= 0x800000) || (delta == 0)) {
+   // Retransmitted already-handed-off request still reaches A to elicit a fresh ACK.
+   npc_lock_free(flowLocks[flowKey]); SetRoute(); Send();
+  }
+  if (delta > IOS_WINDOW) { npc_counter_add(debugCounter[7],1); UnlockDrop(); }
+  delta=seq-st.High;
+  if ((delta != 0) && (delta < 0x800000)) { st.High=seq; }
+  // Fixed documented XOR fold of raw network-order NSID and 64-bit SLBA.
+  uint<32> folded; uint<12> foldHigh;
+  folded=cmd.Nsid ^ cmd.LbaLo; folded=folded ^ cmd.LbaHi;
+  foldHigh=folded[31:24]; blockKey=folded[11:0] ^ folded[23:12]; blockKey=blockKey ^ foldHigh;
+  ownerIp=addressTable._lookup();
+  if (ownerIp == 0) { UnlockDrop(); }
+  if (ownerIp == cfg.AccessIp) {
+   MarkOwner(); stateTable._write(st); npc_lock_free(flowLocks[flowKey]);
+   npc_counter_add(debugCounter[2],1); SetRoute(); Send();
+  }
+  ownerRouteKey=ownerIp[7:0]; ownerRoute=ownerRouteTable._lookup();
+  if ((ownerRoute.Valid == 0) || (ownerRoute.Ip != ownerIp)) { UnlockDrop(); }
+  pending.Psn=seq; pending.Valid=1; pending.OwnerIp=ownerIp; pending.Epoch=cfg.Epoch; pending.Reserved=0;
+  pendingTable._write(pending); stateTable._write(st); npc_lock_free(flowLocks[flowKey]);
+  SnapshotRequest();
+  wireHandoff.Magic=IOS_MAGIC; wireHandoff.Version=1; wireHandoff.Kind=1; wireHandoff.Flow=flowKey;
+  wireHandoff.Epoch=cfg.Epoch; wireHandoff.Reserved=0; wireHandoff.Psn=seq;
+  wireHandoff.AccessIp=cfg.AccessIp; wireHandoff.Reserved2=0; wireHandoff.AccessQp=cfg.AccessQp;
+  wireIp.Dst=ownerIp; wireIp.Len=wireIp.Len+24; wireIp.Sum=0;
+  uint<16> replicaSum; npc_checksum16_calc(replicaSum,wireIp); wireIp.Sum=replicaSum;
+  wireUdp.Len=wireUdp.Len+24; wireUdp.Dst=IOS_HANDOFF_PORT; wireUdp.Sum=0;
+  wireEth.Dst=ownerRoute.Mac;
+  SetRoute(); npc_pkt_add_sys_hdr(); npc_pkt_deparser(); npc_pkt_replicate();
+  npc_pkt_drop(); npc_pkt_new();
+  npc_intrinsic_tm_metadata.OutSubChan=ownerRoute.Channel[8:0];
+  npc_intrinsic_tm_metadata.Sqid=ownerRoute.Sq;
+  npc_intrinsic_tm_metadata.Qindex=1;
+  npc_pkt_add_sys_hdr();
+  npc_pkt_add(wireEth); npc_pkt_add(wireIp); npc_pkt_add(wireUdp); npc_pkt_add(wireHandoff);
+  npc_pkt_add(wireBth); npc_pkt_add(wireCmd); npc_pkt_add(wireCrc);
+  npc_pkt_truncate(0); npc_counter_add(debugCounter[3],1); npc_pkt_send(); npc_exit();
+ } else {
+  ackTemplate=templateTable._lookup(); ackNet=templateNetTable._lookup(); ackEth=templateEthTable._lookup();
+  if (kind == 2) {
+   delta=seq-st.High;
+   if ((delta != 0) && (delta < 0x800000)) { UnlockDrop(); }
+   delta=seq-st.Access;
+   if (delta < 0x800000) {
+    st.Access=seq; st.TemplateValid=1;
+    ackEth.Dst=eth.Dst; ackEth.Src=eth.Src; ackEth.Type=eth.Type; ackNet.VI=ip.VI; ackNet.Tos=ip.Tos; ackNet.Len=ip.Len; ackNet.Id=ip.Id; ackNet.Frag=ip.Frag; ackNet.Ttl=ip.Ttl; ackNet.Proto=ip.Proto; ackNet.Sum=ip.Sum; ackNet.Src=ip.Src; ackNet.Dst=ip.Dst; ackTemplate.UdpSrc=udp.Src; ackTemplate.UdpDst=udp.Dst; ackTemplate.UdpLen=udp.Len; ackTemplate.UdpSum=udp.Sum;
+    ackTemplate.BthOp=bth.Op; ackTemplate.BthFlags=bth.Flags; ackTemplate.BthPkey=bth.Pkey; ackTemplate.BthR0=bth.R0; ackTemplate.BthQp=bth.Qp; ackTemplate.BthR1=bth.R1; ackTemplate.BthPsn=bth.Psn; ackTemplate.AethSyndrome=aeth.Syndrome; ackTemplate.AethMsn=aeth.Msn; ackTemplate.CrcValue=icrc.Value;
+    templateTable._write(ackTemplate); templateNetTable._write(ackNet); templateEthTable._write(ackEth);
+   }
+   // Old ACKs also use the latest cached AETH/CRC template.
+  } else {
+   delta=seq-st.Owner;
+   if ((delta != 0) && (delta < 0x800000)) {
+    if (delta > IOS_WINDOW) { UnlockDrop(); }
+    pending=pendingTable._lookup();
+    if ((pending.Valid == 0) || (pending.Psn != seq) || (pending.Epoch != cfg.Epoch) || (pending.OwnerIp != ip.Src)) { UnlockDrop(); }
+    MarkOwner();
+   }
+  }
+  SetSafe(); stateTable._write(st); npc_lock_free(flowLocks[flowKey]);
+  // Before the first real access ACK no RNIC ACK template exists; later A ACK closes the loop.
+  if (st.TemplateValid == 0) { npc_pkt_drop(); npc_exit(); }
+  wireEth.Dst=ackEth.Dst; wireEth.Src=ackEth.Src; wireEth.Type=ackEth.Type; wireIp.VI=ackNet.VI; wireIp.Tos=ackNet.Tos; wireIp.Len=ackNet.Len; wireIp.Id=ackNet.Id; wireIp.Frag=ackNet.Frag; wireIp.Ttl=ackNet.Ttl; wireIp.Proto=ackNet.Proto; wireIp.Sum=ackNet.Sum; wireIp.Src=ackNet.Src; wireIp.Dst=ackNet.Dst; wireUdp.Src=ackTemplate.UdpSrc; wireUdp.Dst=ackTemplate.UdpDst; wireUdp.Len=ackTemplate.UdpLen; wireUdp.Sum=ackTemplate.UdpSum;
+  wireBth.Op=ackTemplate.BthOp; wireBth.Flags=ackTemplate.BthFlags; wireBth.Pkey=ackTemplate.BthPkey; wireBth.R0=ackTemplate.BthR0; wireBth.Qp=ackTemplate.BthQp; wireBth.R1=ackTemplate.BthR1; wireBth.Psn=ackTemplate.BthPsn; wireAeth.Syndrome=ackTemplate.AethSyndrome; wireAeth.Msn=ackTemplate.AethMsn; wireCrc.Value=ackTemplate.CrcValue;
+  oldPsn=wireBth.Psn; FixAck(); wireEth.Dst=route.Mac;
+  npc_pkt_drop(); npc_pkt_new();
+  npc_intrinsic_tm_metadata.OutSubChan=route.Channel[8:0]; npc_intrinsic_tm_metadata.Sqid=route.Sq; npc_intrinsic_tm_metadata.Qindex=1;
+  npc_pkt_add_sys_hdr(); npc_pkt_add(wireEth); npc_pkt_add(wireIp); npc_pkt_add(wireUdp);
+  npc_pkt_add(wireBth); npc_pkt_add(wireAeth); npc_pkt_add(wireCrc);
+  npc_pkt_truncate(0); npc_counter_add(debugCounter[4],1); npc_pkt_send(); npc_exit();
+ }
+}
+#include "parser.npc"
+NPCProgram(ParseEth(), Main()) main;
